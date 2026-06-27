@@ -12,6 +12,16 @@ inspired by the round-based bomb-defusal gameplay of *Counter-Strike*.
 
 ![gameplay](https://img.shields.io/badge/C%2B%2B17-SDL2-blue)
 
+## Download (Windows)
+
+Prebuilt Windows binaries are published on the
+[**Releases**](../../releases) page. Download `CS3-windows-x64.zip`, extract it,
+and run `cs3.exe` (keep `SDL2.dll` next to it). No installation required.
+
+Releases are produced automatically by the
+[`Release (Windows build)`](.github/workflows/release.yml) GitHub Actions
+workflow whenever a version tag (`v*`) is pushed.
+
 ## Features
 
 - **5v5 Counter-Terrorists vs Terrorists** — you play a Counter-Terrorist; every
