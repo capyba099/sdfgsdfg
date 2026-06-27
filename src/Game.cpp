@@ -8,6 +8,7 @@
 namespace {
 constexpr float PI = 3.14159265358979323846f;
 constexpr float BOT_VIEW_RANGE = 620.0f;
+constexpr float FOV = 1.16f;  // ~66 degrees horizontal field of view
 
 const char* kCtNames[] = {"YOU", "VOLK", "SEAL", "GIGN", "SAS"};
 const char* kTNames[] = {"PHOENIX", "LEET", "ARCTIC", "GUERILLA", "SEPARAT"};
@@ -247,9 +248,11 @@ int Game::run() {
         phase_ = Phase::Freeze;
         phaseTimer_ = cfg::FREEZE_TIME;
         const float dt = 1.0f / 60.0f;
+        bool doRender = std::getenv("CS3_RENDER") != nullptr;
         int lastReported = -1;
         for (int f = 0; f < maxFrames && running_; ++f) {
             update(dt);
+            if (doRender) render();  // exercise the 3D render path headlessly
             if (ctScore_ + tScore_ != lastReported) {
                 lastReported = ctScore_ + tScore_;
                 std::printf("[sim] round=%d ctAlive=%d tAlive=%d score CT %d : %d T  %s\n",
@@ -291,6 +294,13 @@ void Game::handleEvents() {
             mouseDown_ = true;
         else if (e.type == SDL_MOUSEBUTTONUP && e.button.button == SDL_BUTTON_LEFT)
             mouseDown_ = false;
+        else if (e.type == SDL_MOUSEMOTION) {
+            // Mouse-look (first-person): yaw from X, cosmetic pitch from Y.
+            if (relativeMouse_ && player().alive) {
+                player().aim += e.motion.xrel * 0.0026f;
+                pitch_ = clampf(pitch_ - e.motion.yrel * 1.6f, -220.0f, 220.0f);
+            }
+        }
         else if (e.type == SDL_MOUSEWHEEL) {
             // Cycle owned weapons.
             Actor& p = player();
@@ -430,6 +440,12 @@ void Game::update(float dt) {
         }
     }
 
+    // Damage feedback: flash the screen red when the player loses health.
+    const Actor& pl = player();
+    if (pl.alive && pl.hp < prevHp_) damageFlash_ = 0.55f;
+    prevHp_ = pl.alive ? pl.hp : cfg::START_HP;
+    if (damageFlash_ > 0) damageFlash_ -= dt;
+
     mousePrev_ = mouseDown_;
 }
 
@@ -441,23 +457,22 @@ void Game::updatePlayer(float dt) {
     if (!p.alive) return;
 
     const Uint8* ks = SDL_GetKeyboardState(nullptr);
+    // Movement is relative to where the player is looking (FPS controls).
+    Vec2 fwd{std::cos(p.aim), std::sin(p.aim)};
+    Vec2 right{-std::sin(p.aim), std::cos(p.aim)};
     Vec2 move{0, 0};
-    if (ks[SDL_SCANCODE_W]) move.y -= 1;
-    if (ks[SDL_SCANCODE_S]) move.y += 1;
-    if (ks[SDL_SCANCODE_A]) move.x -= 1;
-    if (ks[SDL_SCANCODE_D]) move.x += 1;
+    if (ks[SDL_SCANCODE_W]) move += fwd;
+    if (ks[SDL_SCANCODE_S]) move -= fwd;
+    if (ks[SDL_SCANCODE_D]) move += right;
+    if (ks[SDL_SCANCODE_A]) move -= right;
     bool walking = ks[SDL_SCANCODE_LSHIFT];
 
     float speed = cfg::PLAYER_SPEED * (walking ? cfg::WALK_MULTIPLIER : 1.0f);
     if (move.lengthSq() > 0) {
         p.pos += move.normalized() * speed * dt;
         p.pos = map_.collide(p.pos, cfg::PLAYER_RADIUS);
+        viewBob_ += speed * dt * 0.02f;  // drive weapon bob
     }
-
-    // Aim toward the mouse cursor.
-    Vec2 worldMouse = Vec2{(float)mouseX_, (float)mouseY_} + camera_;
-    Vec2 toMouse = worldMouse - p.pos;
-    if (toMouse.lengthSq() > 1) p.aim = std::atan2(toMouse.y, toMouse.x);
 
     if (phase_ != Phase::Live) return;  // no shooting / planting in freeze
 
@@ -833,14 +848,39 @@ void Game::updateBot(Actor& a, float dt, int selfIdx) {
 // ---------------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------------
+void Game::updateMouseMode() {
+    bool want = !headless_ && player().alive &&
+                (phase_ == Phase::Freeze || phase_ == Phase::Live ||
+                 phase_ == Phase::RoundEnd);
+    if (want != relativeMouse_) {
+        SDL_SetRelativeMouseMode(want ? SDL_TRUE : SDL_FALSE);
+        relativeMouse_ = want;
+    }
+}
+
 void Game::render() {
+    updateMouseMode();
+
     SDL_SetRenderDrawColor(renderer_, 20, 20, 24, 255);
     SDL_RenderClear(renderer_);
 
     if (phase_ == Phase::MainMenu) {
         renderMainMenu();
     } else {
-        renderWorld();
+        renderWorld3D();
+        renderSprites();
+        renderViewmodel();
+        renderCrosshair();
+
+        // Damage flash overlay.
+        if (damageFlash_ > 0) {
+            SDL_SetRenderDrawColor(renderer_, 200, 30, 30,
+                                   (Uint8)(clampf(damageFlash_, 0, 0.55f) /
+                                           0.55f * 110));
+            SDL_Rect full{0, 0, cfg::SCREEN_W, cfg::SCREEN_H};
+            SDL_RenderFillRect(renderer_, &full);
+        }
+
         renderHUD();
         renderMinimap();
         if (phase_ == Phase::Freeze && buyMenuOpen_) renderBuyMenu();
@@ -859,6 +899,311 @@ void Game::drawFilledCircle(int cx, int cy, int radius, SDL_Color c) {
         int dx = (int)std::sqrt((float)radius * radius - dy * dy);
         SDL_RenderDrawLine(renderer_, cx - dx, cy + dy, cx + dx, cy + dy);
     }
+}
+
+bool Game::projectToScreen(const Vec2& world, float& sx, float& depth) const {
+    const Actor& p = actors_[0];
+    float posX = p.pos.x / cfg::TILE, posY = p.pos.y / cfg::TILE;
+    float dirX = std::cos(p.aim), dirY = std::sin(p.aim);
+    float fovScale = std::tan(FOV * 0.5f);
+    float planeX = -dirY * fovScale, planeY = dirX * fovScale;
+    float spx = world.x / cfg::TILE - posX;
+    float spy = world.y / cfg::TILE - posY;
+    float invDet = 1.0f / (planeX * dirY - dirX * planeY);
+    float tx = invDet * (dirY * spx - dirX * spy);
+    float ty = invDet * (-planeY * spx + planeX * spy);
+    if (ty <= 0.02f) return false;
+    sx = (cfg::SCREEN_W / 2.0f) * (1.0f + tx / ty);
+    depth = ty;
+    return true;
+}
+
+void Game::renderWorld3D() {
+    const Actor& p = actors_[0];
+    const int W = cfg::SCREEN_W, H = cfg::SCREEN_H;
+    int horizon = H / 2 + (int)pitch_;
+
+    // Ceiling and floor as vertical gradients around the horizon.
+    for (int y = 0; y < H; ++y) {
+        SDL_Color c;
+        if (y < horizon) {
+            float t = horizon > 0 ? (float)y / horizon : 0.0f;  // 0 top..1 horizon
+            Uint8 v = (Uint8)(26 + 22 * t);
+            c = {(Uint8)(v * 0.7f), (Uint8)(v * 0.8f), v, 255};
+        } else {
+            float denom = std::max(1, H - horizon);
+            float t = (float)(y - horizon) / denom;  // 0 horizon..1 bottom
+            Uint8 v = (Uint8)(58 - 34 * t);
+            c = {v, (Uint8)(v * 0.95f), (Uint8)(v * 0.82f), 255};
+        }
+        SDL_SetRenderDrawColor(renderer_, c.r, c.g, c.b, 255);
+        SDL_RenderDrawLine(renderer_, 0, y, W, y);
+    }
+
+    // Cast one ray per screen column (DDA over the tile grid).
+    float posX = p.pos.x / cfg::TILE, posY = p.pos.y / cfg::TILE;
+    float dirX = std::cos(p.aim), dirY = std::sin(p.aim);
+    float fovScale = std::tan(FOV * 0.5f);
+    float planeX = -dirY * fovScale, planeY = dirX * fovScale;
+    zbuffer_.assign(W, 1e9f);
+
+    for (int x = 0; x < W; ++x) {
+        float cameraX = 2.0f * x / W - 1.0f;
+        float rx = dirX + planeX * cameraX;
+        float ry = dirY + planeY * cameraX;
+        int mapX = (int)posX, mapY = (int)posY;
+        float dDX = (std::fabs(rx) < 1e-6f) ? 1e30f : std::fabs(1.0f / rx);
+        float dDY = (std::fabs(ry) < 1e-6f) ? 1e30f : std::fabs(1.0f / ry);
+        int stepX, stepY;
+        float sDX, sDY;
+        if (rx < 0) { stepX = -1; sDX = (posX - mapX) * dDX; }
+        else { stepX = 1; sDX = (mapX + 1 - posX) * dDX; }
+        if (ry < 0) { stepY = -1; sDY = (posY - mapY) * dDY; }
+        else { stepY = 1; sDY = (mapY + 1 - posY) * dDY; }
+
+        int side = 0;
+        bool hit = false;
+        int guard = 0;
+        while (!hit && guard++ < 512) {
+            if (sDX < sDY) { sDX += dDX; mapX += stepX; side = 0; }
+            else { sDY += dDY; mapY += stepY; side = 1; }
+            if (map_.isWallTile(mapX, mapY)) hit = true;
+        }
+        float perp = (side == 0) ? (sDX - dDX) : (sDY - dDY);
+        if (perp < 1e-3f) perp = 1e-3f;
+        zbuffer_[x] = perp;
+
+        int lineH = (int)(H / perp);
+        int ds = -lineH / 2 + horizon;
+        int de = lineH / 2 + horizon;
+        int dsc = ds < 0 ? 0 : ds;
+        int dec = de >= H ? H - 1 : de;
+
+        float wallX = (side == 0) ? (posY + perp * ry) : (posX + perp * rx);
+        wallX -= std::floor(wallX);
+
+        float shade = clampf(1.0f - perp / 14.0f, 0.18f, 1.0f);
+        if (side == 1) shade *= 0.72f;                 // sides facing away darker
+        if (wallX < 0.04f || wallX > 0.96f) shade *= 0.6f;  // vertical seams
+
+        SDL_Color wc = cfg::C_WALL;
+        SDL_SetRenderDrawColor(renderer_, (Uint8)(wc.r * shade),
+                               (Uint8)(wc.g * shade), (Uint8)(wc.b * shade), 255);
+        SDL_RenderDrawLine(renderer_, x, dsc, x, dec);
+
+        // A lit cap at the very top of the wall slice for depth cueing.
+        if (ds >= 0) {
+            SDL_SetRenderDrawColor(renderer_, (Uint8)(cfg::C_WALL_TOP.r * shade),
+                                   (Uint8)(cfg::C_WALL_TOP.g * shade),
+                                   (Uint8)(cfg::C_WALL_TOP.b * shade), 255);
+            SDL_RenderDrawPoint(renderer_, x, dsc);
+        }
+    }
+}
+
+void Game::renderSprites() {
+    const Actor& p = actors_[0];
+    const int W = cfg::SCREEN_W, H = cfg::SCREEN_H;
+    int horizon = H / 2 + (int)pitch_;
+    float posX = p.pos.x / cfg::TILE, posY = p.pos.y / cfg::TILE;
+    float dirX = std::cos(p.aim), dirY = std::sin(p.aim);
+    float fovScale = std::tan(FOV * 0.5f);
+    float planeX = -dirY * fovScale, planeY = dirX * fovScale;
+    float invDet = 1.0f / (planeX * dirY - dirX * planeY);
+
+    struct Spr { float tx, ty; const Actor* a; };
+    std::vector<Spr> list;
+    for (size_t i = 1; i < actors_.size(); ++i) {
+        const Actor& a = actors_[i];
+        float spx = a.pos.x / cfg::TILE - posX;
+        float spy = a.pos.y / cfg::TILE - posY;
+        float tx = invDet * (dirY * spx - dirX * spy);
+        float ty = invDet * (-planeY * spx + planeX * spy);
+        if (ty > 0.06f) list.push_back({tx, ty, &a});
+    }
+    std::sort(list.begin(), list.end(),
+              [](const Spr& A, const Spr& B) { return A.ty > B.ty; });
+
+    for (const auto& s : list) {
+        float screenX = (W / 2.0f) * (1.0f + s.tx / s.ty);
+        float fullH = H / s.ty;
+        float shade = clampf(1.0f - s.ty / 14.0f, 0.22f, 1.0f);
+
+        if (s.a->alive) {
+            float actorH = fullH * 0.85f;
+            float feetY = horizon + fullH * 0.5f;
+            float headY = feetY - actorH;
+            float spriteW = actorH * 0.45f;
+            int x0 = (int)(screenX - spriteW / 2);
+            int x1 = (int)(screenX + spriteW / 2);
+            SDL_Color team = (s.a->team == Team::CT) ? cfg::C_CT : cfg::C_T;
+            SDL_Color body{(Uint8)(team.r * shade), (Uint8)(team.g * shade),
+                           (Uint8)(team.b * shade), 255};
+            SDL_Color head{(Uint8)(220 * shade), (Uint8)(185 * shade),
+                           (Uint8)(150 * shade), 255};
+            int headBound = (int)(headY + 0.26f * actorH);
+
+            for (int x = x0; x <= x1; ++x) {
+                if (x < 0 || x >= W) continue;
+                if (s.ty >= zbuffer_[x]) continue;  // occluded by a wall
+                float u = (x1 > x0) ? (float)(x - x0) / (x1 - x0) : 0.5f;
+                if (u <= 0.16f || u >= 0.84f) continue;  // outside silhouette
+                bool inHead = (u > 0.32f && u < 0.68f);
+                float topV = inHead ? 0.0f : 0.26f;
+                float botV = (u > 0.22f && u < 0.78f) ? 1.0f : 0.68f;
+                int yTop = (int)(headY + topV * actorH);
+                int yBot = (int)(headY + botV * actorH);
+                if (inHead) {
+                    SDL_SetRenderDrawColor(renderer_, head.r, head.g, head.b, 255);
+                    SDL_RenderDrawLine(renderer_, x, std::max(0, yTop), x,
+                                       std::min(H - 1, headBound));
+                }
+                int bs = std::max(yTop, headBound);
+                SDL_SetRenderDrawColor(renderer_, body.r, body.g, body.b, 255);
+                SDL_RenderDrawLine(renderer_, x, std::max(0, bs), x,
+                                   std::min(H - 1, yBot));
+            }
+
+            // Health bar above the head (enemy = red, ally = green).
+            int cx = (int)screenX;
+            if (cx >= 0 && cx < W && s.ty < zbuffer_[cx]) {
+                int bw = std::max(8, (int)spriteW);
+                int bx = cx - bw / 2;
+                int by = (int)headY - 7;
+                if (by > 2 && by < H - 2) {
+                    SDL_SetRenderDrawColor(renderer_, 0, 0, 0, 190);
+                    SDL_Rect bg{bx - 1, by - 1, bw + 2, 5};
+                    SDL_RenderFillRect(renderer_, &bg);
+                    SDL_Color hc = (s.a->team == p.team) ? cfg::C_HEALTH
+                                                         : cfg::col(220, 80, 80);
+                    SDL_SetRenderDrawColor(renderer_, hc.r, hc.g, hc.b, 255);
+                    SDL_Rect hb{bx, by, bw * s.a->hp / cfg::START_HP, 3};
+                    SDL_RenderFillRect(renderer_, &hb);
+                }
+            }
+        } else {
+            // Corpse: a low flat marker on the floor.
+            float markH = fullH * 0.12f;
+            float feetY = horizon + fullH * 0.5f;
+            float spriteW = fullH * 0.5f;
+            int x0 = (int)(screenX - spriteW / 2);
+            int x1 = (int)(screenX + spriteW / 2);
+            SDL_Color c{(Uint8)(80 * shade), (Uint8)(40 * shade),
+                        (Uint8)(40 * shade), 255};
+            for (int x = x0; x <= x1; ++x) {
+                if (x < 0 || x >= W) continue;
+                if (s.ty >= zbuffer_[x]) continue;
+                SDL_SetRenderDrawColor(renderer_, c.r, c.g, c.b, 255);
+                SDL_RenderDrawLine(renderer_, x, (int)(feetY - markH), x,
+                                   std::min(H - 1, (int)feetY));
+            }
+        }
+    }
+
+    // Planted bomb as a small blinking billboard near the floor.
+    if (bombPlanted_ && !bombDefused_) {
+        float sx, depth;
+        if (projectToScreen(bombPos_, sx, depth)) {
+            float fullH = H / depth;
+            float boxH = fullH * 0.22f;
+            float feetY = horizon + fullH * 0.5f;
+            float w = boxH * 1.5f;
+            int x0 = (int)(sx - w / 2), x1 = (int)(sx + w / 2);
+            bool blink = ((int)(bombTimer_ * 4) & 1) == 0;
+            SDL_Color c = blink ? cfg::col(255, 60, 60) : cfg::col(120, 30, 30);
+            for (int x = x0; x <= x1; ++x) {
+                if (x < 0 || x >= W) continue;
+                if (depth >= zbuffer_[x]) continue;
+                SDL_SetRenderDrawColor(renderer_, c.r, c.g, c.b, 255);
+                SDL_RenderDrawLine(renderer_, x, (int)(feetY - boxH), x,
+                                   std::min(H - 1, (int)feetY));
+            }
+        }
+    }
+
+    // Floating text (kill markers, "BOMB PLANTED") as world billboards.
+    for (const auto& f : floatTexts_) {
+        float sx, depth;
+        if (!projectToScreen(f.pos, sx, depth)) continue;
+        int cx = (int)sx;
+        if (cx < 0 || cx >= W || depth >= zbuffer_[cx]) continue;
+        int y = horizon - (int)(H / depth * 0.4f);
+        SDL_Color c = f.color;
+        c.a = (Uint8)(clampf(f.life, 0, 1) * 255);
+        Font::drawCentered(renderer_, f.text, cx, y, 2, c);
+    }
+}
+
+void Game::renderViewmodel() {
+    const Actor& p = actors_[0];
+    if (!p.alive) return;
+    const int W = cfg::SCREEN_W, H = cfg::SCREEN_H;
+    int cx = W / 2;
+    int bob = (int)(std::sin(viewBob_) * 7.0f);
+    int gunY = H - 64 + bob;  // anchored just above the HUD bar
+
+    WeaponId w = p.weapon;
+    SDL_Color metal = cfg::col(38, 38, 44);
+    SDL_Color metal2 = cfg::col(64, 64, 72);
+    SDL_Color skin = cfg::col(200, 165, 130);
+
+    auto fillRect = [&](int x, int y, int wd, int ht, SDL_Color c) {
+        SDL_SetRenderDrawColor(renderer_, c.r, c.g, c.b, 255);
+        SDL_Rect r{x, y, wd, ht};
+        SDL_RenderFillRect(renderer_, &r);
+    };
+
+    int barrelLen, barrelW;
+    switch (w) {
+        case WeaponId::Sniper: barrelLen = 250; barrelW = 18; break;
+        case WeaponId::Rifle:  barrelLen = 190; barrelW = 18; break;
+        case WeaponId::Smg:    barrelLen = 140; barrelW = 16; break;
+        case WeaponId::Pistol: barrelLen = 78;  barrelW = 16; break;
+        default:               barrelLen = 0;   barrelW = 0;  break;  // knife
+    }
+
+    if (w == WeaponId::Knife) {
+        // A blade rising toward the center.
+        for (int i = 0; i < 60; ++i) {
+            int wdt = 16 - i / 5;
+            fillRect(cx + 40 - wdt / 2, gunY - 20 - i, wdt, 1,
+                     cfg::col(190, 195, 205));
+        }
+        fillRect(cx + 30, gunY + 4, 30, 60, metal);  // handle
+        fillRect(cx + 26, gunY + 40, 40, 24, skin);  // hand
+        return;
+    }
+
+    int bx = cx + 26;  // barrel slightly right of center
+    fillRect(bx - barrelW / 2, gunY - barrelLen, barrelW, barrelLen, metal2);
+    fillRect(bx - barrelW / 2 - 2, gunY - barrelLen, 3, barrelLen, metal);
+    fillRect(cx + 44, gunY - 18, 52, 96, metal);     // receiver / grip
+    fillRect(cx + 36, gunY + 44, 56, 30, skin);      // hand
+    if (w == WeaponId::Rifle || w == WeaponId::Sniper || w == WeaponId::Smg)
+        fillRect(cx + 96, gunY + 4, 44, 26, metal);  // stock
+
+    if (w == WeaponId::Sniper) {
+        // Scope tube.
+        fillRect(bx + 8, gunY - barrelLen + 60, 60, 14, cfg::col(20, 20, 24));
+    }
+
+    // Muzzle flash.
+    if (p.muzzleFlash > 0) {
+        drawFilledCircle(bx, gunY - barrelLen, 14, cfg::col(255, 225, 130, 235));
+        drawFilledCircle(bx, gunY - barrelLen, 7, cfg::col(255, 255, 220, 255));
+    }
+}
+
+void Game::renderCrosshair() {
+    int cx = cfg::SCREEN_W / 2;
+    int cy = cfg::SCREEN_H / 2 + (int)pitch_;
+    SDL_SetRenderDrawColor(renderer_, 120, 235, 140, 220);
+    int gap = 6, len = 10;
+    SDL_RenderDrawLine(renderer_, cx - gap - len, cy, cx - gap, cy);
+    SDL_RenderDrawLine(renderer_, cx + gap, cy, cx + gap + len, cy);
+    SDL_RenderDrawLine(renderer_, cx, cy - gap - len, cx, cy - gap);
+    SDL_RenderDrawLine(renderer_, cx, cy + gap, cx, cy + gap + len);
+    SDL_RenderDrawPoint(renderer_, cx, cy);
 }
 
 void Game::renderWorld() {

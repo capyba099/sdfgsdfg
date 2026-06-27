@@ -1,14 +1,21 @@
 # CS 3 — Tactical Strike
 
-A complete, playable top-down tactical shooter written in **C++17** with **SDL2**,
-inspired by the round-based bomb-defusal gameplay of *Counter-Strike*.
+A complete, playable **first-person 3D** tactical shooter written in **C++17**
+with **SDL2**, inspired by the round-based bomb-defusal gameplay of
+*Counter-Strike*.
 
-> **Scope note:** A literal, 1:1 recreation of Counter-Strike (full 3D engine,
-> online netcode, thousands of art assets) is far beyond what a single project
-> can deliver. CS 3 instead implements the *core game* faithfully as a 2D
-> top-down shooter: two teams, an economy, a bomb objective, AI bots, weapons,
-> rounds and a win condition — all in self-contained C++ with no external art
-> or font assets.
+The 3D view is rendered with a custom **software raycasting engine** (in the
+tradition of Wolfenstein 3D / DOOM): the game simulates on a 2D tile grid, but
+is drawn as a true first-person perspective with distance-shaded walls,
+floor/ceiling, billboarded enemies, a weapon viewmodel and a depth-buffered
+sprite pipeline — all using only SDL2's 2D primitives, **no GPU/OpenGL or 3D
+model assets required**.
+
+> **Scope note:** A literal, 1:1 recreation of Counter-Strike (a full modern 3D
+> engine, online netcode, thousands of art assets) is far beyond what a single
+> project can deliver. CS 3 instead implements the *core game* faithfully: two
+> teams, an economy, a bomb objective, AI bots, weapons, rounds and a win
+> condition — all in self-contained C++ with no external art or font assets.
 
 ![gameplay](https://img.shields.io/badge/C%2B%2B17-SDL2-blue)
 
@@ -24,6 +31,9 @@ workflow whenever a version tag (`v*`) is pushed.
 
 ## Features
 
+- **First-person 3D** via a from-scratch software raycaster: shaded walls,
+  gradient floor/ceiling, mouse-look, a weapon viewmodel with muzzle flash, a
+  crosshair, damage flashes and depth-buffered enemy billboards.
 - **5v5 Counter-Terrorists vs Terrorists** — you play a Counter-Terrorist; every
   other slot is filled by an AI bot.
 - **Bomb-defusal objective** — terrorists carry and plant the bomb on site A or
@@ -88,8 +98,8 @@ cmake --build build -j
 
 | Input | Action |
 |------|--------|
-| `W` `A` `S` `D` | Move |
-| Mouse | Aim |
+| `W` `A` `S` `D` | Move forward/back and strafe (relative to where you look) |
+| Mouse | Look around (first-person mouse-look) |
 | Left click | Shoot (hold for automatic weapons) |
 | `R` | Reload |
 | `1`–`5` | Select knife / pistol / SMG / rifle / sniper |
@@ -119,7 +129,7 @@ src/
   Font.{h,cpp}  Self-contained 5x7 bitmap text renderer
   Weapon.{h,cpp}Weapon catalogue & stats
   Map.{h,cpp}   Tile map, collision, raycasting, BFS pathfinding, rendering
-  Game.{h,cpp}  Entities, player control, bot AI, combat, bomb, rounds, HUD
+  Game.{h,cpp}  Entities, player, bot AI, combat, bomb, rounds, HUD, 3D renderer
   main.cpp      Entry point
 CMakeLists.txt  Build configuration
 build.sh        One-command build helper

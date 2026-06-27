@@ -114,8 +114,14 @@ private:
     void updateBomb(float dt);
 
     // Rendering helpers ----------------------------------------------------
-    void renderWorld();
+    void renderWorld();   // legacy 2D top-down (unused; kept for reference)
     void renderActor(const Actor& a);
+    void renderWorld3D();  // first-person raycasting renderer
+    void renderSprites();
+    void renderViewmodel();
+    void renderCrosshair();
+    void updateMouseMode();
+    bool projectToScreen(const Vec2& world, float& sx, float& depth) const;
     void renderHUD();
     void renderBuyMenu();
     void renderMainMenu();
@@ -135,6 +141,14 @@ private:
     SDL_Renderer* renderer_ = nullptr;
     bool running_ = false;
     bool headless_ = false;
+
+    // First-person renderer state.
+    std::vector<float> zbuffer_;   // per-column wall depth (tile units)
+    float pitch_ = 0.0f;           // cosmetic vertical look (horizon offset)
+    float viewBob_ = 0.0f;         // weapon bob phase
+    bool relativeMouse_ = false;   // mouse captured for look
+    int prevHp_ = cfg::START_HP;   // for the damage flash
+    float damageFlash_ = 0.0f;
 
     Map map_;
     std::vector<Actor> actors_;
