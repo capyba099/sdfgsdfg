@@ -4,6 +4,7 @@
 #include <random>
 #include <string>
 #include <vector>
+#include "Audio.h"
 #include "Config.h"
 #include "Map.h"
 #include "Vec2.h"
@@ -12,6 +13,10 @@
 enum class Phase { MainMenu, Freeze, Live, RoundEnd, MatchEnd };
 
 enum class BotState { Idle, MoveToObjective, Engage, PlantOrDefuse };
+
+enum class MenuScreen { Main, Join };
+
+enum class NetMode { Single, Host, Client };
 
 struct Actor {
     Team team = Team::CT;
@@ -56,8 +61,23 @@ struct Actor {
     float aimError = 0.0f;
     float strafeDir = 1.0f;
     float strafeTimer = 0.0f;
+    float extraSpread = 0.0f;   // difficulty-based bot inaccuracy
+    float anim = 0.0f;          // walk-cycle phase for sprite animation
+
+    // Networking: a slot controlled by a remote human instead of the AI.
+    bool remote = false;
+    bool connected = false;     // remote slot currently occupied
+    int netButtons = 0;         // latest input bitmask from the remote client
+    int netWeaponSel = 0;       // requested weapon slot (0 = none)
+    int prevButtons = 0;        // previous frame buttons (for edge detection)
 
     const WeaponDef& curDef() const { return weaponDef(weapon); }
+};
+
+// Bitmask for buttons sent over the network (and reused for local intent).
+enum Button {
+    BtnFwd = 1, BtnBack = 2, BtnLeft = 4, BtnRight = 8,
+    BtnFire = 16, BtnReload = 32, BtnUse = 64, BtnWalk = 128
 };
 
 struct Tracer {
@@ -96,8 +116,30 @@ private:
 
     // Player ---------------------------------------------------------------
     void updatePlayer(float dt);
+    void applyInput(Actor& a, int buttons, int weaponSel, float dt, int selfIdx);
     void doBuy(WeaponId id);
     void buyArmor();
+    int gatherLocalButtons() const;
+
+    // Spectator ------------------------------------------------------------
+    int viewIndex() const;
+    Actor& viewActor() { return actors_[viewIndex()]; }
+    const Actor& viewActor() const { return actors_[viewIndex()]; }
+    void cycleSpectate(int dir);
+
+    // Audio ----------------------------------------------------------------
+    void playAt(Audio::Sfx s, const Vec2& pos, float baseVol = 1.0f);
+
+    // Modes / menu ---------------------------------------------------------
+    void startSinglePlayer();
+    void handleMenuKey(SDL_Keycode k);
+
+    // Networking -----------------------------------------------------------
+    void startHost();
+    void startClient(const std::string& ip, int port);
+    void netHostTick(float dt);
+    void netClientTick(float dt);
+    void shutdownNet();
 
     // Bots -----------------------------------------------------------------
     void updateBot(Actor& a, float dt, int selfIdx);
@@ -134,13 +176,17 @@ private:
 
     // Helpers --------------------------------------------------------------
     int teamAlive(Team t) const;
-    Actor& player() { return actors_[0]; }
+    Actor& player() { return actors_[localIndex_]; }
+    const Actor& player() const { return actors_[localIndex_]; }
     float frand(float lo, float hi);
 
     SDL_Window* window_ = nullptr;
     SDL_Renderer* renderer_ = nullptr;
     bool running_ = false;
     bool headless_ = false;
+
+    Audio audio_;
+    Difficulty difficulty_ = Difficulty::Normal;
 
     // First-person renderer state.
     std::vector<float> zbuffer_;   // per-column wall depth (tile units)
@@ -149,6 +195,22 @@ private:
     bool relativeMouse_ = false;   // mouse captured for look
     int prevHp_ = cfg::START_HP;   // for the damage flash
     float damageFlash_ = 0.0f;
+    float recoil_ = 0.0f;          // viewmodel recoil kick
+    float hitMarker_ = 0.0f;       // crosshair hit feedback
+    float footstepTimer_ = 0.0f;   // throttles the local footstep sound
+    float bombBeepTimer_ = 0.0f;   // throttles bomb beeping
+
+    // Mode / menu / spectator state.
+    NetMode netMode_ = NetMode::Single;
+    int localIndex_ = 0;           // which actor the local human controls
+    int spectIdx_ = 0;             // spectated actor while dead
+    MenuScreen menuScreen_ = MenuScreen::Main;
+    int menuSel_ = 0;
+    std::string joinIp_ = "127.0.0.1";
+    int joinPort_ = 27015;
+    std::string netStatus_;        // connection status message for menus
+    struct NetState;               // opaque networking state (see Net.cpp)
+    NetState* net_ = nullptr;
 
     Map map_;
     std::vector<Actor> actors_;

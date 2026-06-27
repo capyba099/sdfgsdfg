@@ -57,3 +57,27 @@ const SDL_Color C_BULLET = col(255, 230, 120);
 }  // namespace cfg
 
 enum class Team { CT, T };
+
+enum class Difficulty { Easy, Normal, Hard };
+
+// Per-difficulty bot tuning. Higher difficulty = faster reactions, tighter aim.
+struct BotTuning {
+    float reactMin, reactMax;  // reaction delay before opening fire (s)
+    float aimError;            // random aim offset magnitude (rad)
+    float spreadMul;           // extra weapon inaccuracy multiplier
+    float turnSpeed;           // how fast they swing onto a target (rad/s)
+    float viewRange;           // how far they can spot enemies (world units)
+    float fireAlign;           // |angle error| under which they pull the trigger
+};
+
+inline BotTuning botTuning(Difficulty d) {
+    switch (d) {
+        case Difficulty::Easy:
+            return {0.55f, 1.10f, 0.40f, 2.60f, 4.5f, 460.0f, 0.10f};
+        case Difficulty::Hard:
+            return {0.12f, 0.30f, 0.08f, 1.00f, 8.0f, 640.0f, 0.22f};
+        case Difficulty::Normal:
+        default:
+            return {0.32f, 0.62f, 0.18f, 1.55f, 6.0f, 560.0f, 0.16f};
+    }
+}

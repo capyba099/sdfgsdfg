@@ -24,6 +24,8 @@ float angleDiff(float a, float b) {
 Game::Game() : rng_(std::random_device{}()) {}
 
 Game::~Game() {
+    shutdownNet();
+    audio_.shutdown();
     if (renderer_) SDL_DestroyRenderer(renderer_);
     if (window_) SDL_DestroyWindow(window_);
     SDL_Quit();
@@ -51,6 +53,8 @@ bool Game::init() {
         return false;
     }
     SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_BLEND);
+    std::srand((unsigned)SDL_GetPerformanceCounter());
+    audio_.init();  // optional: game still runs without sound
     startMatch();
     phase_ = Phase::MainMenu;
     return true;
@@ -123,6 +127,12 @@ void Game::resetActorsForRound() {
         a.repathTimer = 0;
         a.targetIdx = -1;
         a.reactionTimer = 0;
+        a.anim = 0;
+        a.prevButtons = 0;
+        a.netButtons = 0;
+        a.netWeaponSel = 0;
+        bool isBot = !a.isPlayer && !(a.remote && a.connected);
+        a.extraSpread = isBot ? botTuning(difficulty_).spreadMul : 1.0f;
         giveLoadout(a);
 
         if (a.team == Team::CT) {
@@ -215,6 +225,9 @@ void Game::endRound(Team winner, const std::string& reason) {
                                           "TERRORISTS WIN");
     roundMessage_ += " - " + reason;
 
+    if (audio_.ready() && !headless_)
+        audio_.play(winner == player().team ? Audio::Win : Audio::Lose, 0.6f);
+
     if (ctScore_ >= cfg::ROUNDS_TO_WIN || tScore_ >= cfg::ROUNDS_TO_WIN) {
         phase_ = Phase::MatchEnd;
         phaseTimer_ = 9999.0f;
@@ -289,20 +302,34 @@ int Game::run() {
 void Game::handleEvents() {
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
-        if (e.type == SDL_QUIT) running_ = false;
-        else if (e.type == SDL_MOUSEBUTTONDOWN && e.button.button == SDL_BUTTON_LEFT)
-            mouseDown_ = true;
-        else if (e.type == SDL_MOUSEBUTTONUP && e.button.button == SDL_BUTTON_LEFT)
+        if (e.type == SDL_QUIT) {
+            running_ = false;
+        } else if (e.type == SDL_TEXTINPUT) {
+            if (phase_ == Phase::MainMenu && menuScreen_ == MenuScreen::Join) {
+                for (const char* c = e.text.text; *c; ++c) {
+                    if ((*c >= '0' && *c <= '9') || *c == '.' || *c == ':') {
+                        if (joinIp_.size() < 21) joinIp_.push_back(*c);
+                    }
+                }
+            }
+        } else if (e.type == SDL_MOUSEBUTTONDOWN &&
+                   e.button.button == SDL_BUTTON_LEFT) {
+            if (phase_ == Phase::MainMenu) {
+                // ignored; menu is keyboard driven
+            } else if (!player().alive) {
+                cycleSpectate(+1);  // dead: click to change spectated teammate
+            } else {
+                mouseDown_ = true;
+            }
+        } else if (e.type == SDL_MOUSEBUTTONUP &&
+                   e.button.button == SDL_BUTTON_LEFT) {
             mouseDown_ = false;
-        else if (e.type == SDL_MOUSEMOTION) {
-            // Mouse-look (first-person): yaw from X, cosmetic pitch from Y.
+        } else if (e.type == SDL_MOUSEMOTION) {
             if (relativeMouse_ && player().alive) {
                 player().aim += e.motion.xrel * 0.0026f;
                 pitch_ = clampf(pitch_ - e.motion.yrel * 1.6f, -220.0f, 220.0f);
             }
-        }
-        else if (e.type == SDL_MOUSEWHEEL) {
-            // Cycle owned weapons.
+        } else if (e.type == SDL_MOUSEWHEEL) {
             Actor& p = player();
             if (p.alive) {
                 int dir = e.wheel.y > 0 ? 1 : -1;
@@ -314,50 +341,96 @@ void Game::handleEvents() {
             }
         } else if (e.type == SDL_KEYDOWN) {
             SDL_Keycode k = e.key.keysym.sym;
-            if (k == SDLK_ESCAPE) {
-                if (phase_ == Phase::MainMenu) running_ = false;
-                else buyMenuOpen_ = false;
-            }
-            if (phase_ == Phase::MainMenu) {
-                if (k == SDLK_RETURN || k == SDLK_SPACE) {
-                    startMatch();
-                }
-                continue;
-            }
+
+            if (phase_ == Phase::MainMenu) { handleMenuKey(k); continue; }
+
             if (phase_ == Phase::MatchEnd) {
-                if (k == SDLK_RETURN || k == SDLK_SPACE) {
-                    startMatch();
+                if (k == SDLK_RETURN || k == SDLK_SPACE || k == SDLK_ESCAPE) {
+                    shutdownNet();
                     phase_ = Phase::MainMenu;
+                    menuScreen_ = MenuScreen::Main;
                 }
                 continue;
             }
 
+            if (k == SDLK_ESCAPE) { buyMenuOpen_ = false; continue; }
             if (k == SDLK_TAB) showScoreboard_ = true;
-            if (k == SDLK_b && phase_ == Phase::Freeze) buyMenuOpen_ = !buyMenuOpen_;
+
+            // Spectator controls while dead.
+            if (!player().alive) {
+                if (k == SDLK_a || k == SDLK_LEFT) cycleSpectate(-1);
+                else if (k == SDLK_d || k == SDLK_RIGHT) cycleSpectate(+1);
+                continue;
+            }
+
+            if (k == SDLK_b && phase_ == Phase::Freeze)
+                buyMenuOpen_ = !buyMenuOpen_;
 
             Actor& p = player();
-            // Buying (only in freeze phase with menu open).
             if (phase_ == Phase::Freeze && buyMenuOpen_) {
                 if (k == SDLK_1) doBuy(WeaponId::Pistol);
                 else if (k == SDLK_2) doBuy(WeaponId::Smg);
                 else if (k == SDLK_3) doBuy(WeaponId::Rifle);
                 else if (k == SDLK_4) doBuy(WeaponId::Sniper);
                 else if (k == SDLK_5) buyArmor();
-            } else if (p.alive) {
-                // Weapon selection by slot.
-                auto sel = [&](WeaponId w) { if (p.owned[(size_t)w]) switchWeapon(p, w); };
+            } else {
+                auto sel = [&](WeaponId w) {
+                    if (p.owned[(size_t)w]) switchWeapon(p, w);
+                };
                 if (k == SDLK_1) sel(WeaponId::Knife);
                 else if (k == SDLK_2) sel(WeaponId::Pistol);
                 else if (k == SDLK_3) sel(WeaponId::Smg);
                 else if (k == SDLK_4) sel(WeaponId::Rifle);
                 else if (k == SDLK_5) sel(WeaponId::Sniper);
-                else if (k == SDLK_r) startReload(p);
             }
         } else if (e.type == SDL_KEYUP) {
             if (e.key.keysym.sym == SDLK_TAB) showScoreboard_ = false;
         }
     }
     SDL_GetMouseState(&mouseX_, &mouseY_);
+}
+
+void Game::handleMenuKey(SDL_Keycode k) {
+    if (menuScreen_ == MenuScreen::Join) {
+        if (k == SDLK_RETURN || k == SDLK_KP_ENTER) {
+            SDL_StopTextInput();
+            startClient(joinIp_, joinPort_);
+        } else if (k == SDLK_ESCAPE) {
+            menuScreen_ = MenuScreen::Main;
+            SDL_StopTextInput();
+        } else if (k == SDLK_BACKSPACE && !joinIp_.empty()) {
+            joinIp_.pop_back();
+        }
+        return;
+    }
+
+    const int N = 5;  // PLAY, HOST, JOIN, DIFFICULTY, QUIT
+    if (k == SDLK_UP || k == SDLK_w) {
+        menuSel_ = (menuSel_ + N - 1) % N;
+        if (audio_.ready()) audio_.play(Audio::UiMove, 0.5f);
+    } else if (k == SDLK_DOWN || k == SDLK_s) {
+        menuSel_ = (menuSel_ + 1) % N;
+        if (audio_.ready()) audio_.play(Audio::UiMove, 0.5f);
+    } else if (k == SDLK_LEFT || k == SDLK_RIGHT) {
+        if (menuSel_ == 3) {
+            int step = (k == SDLK_RIGHT) ? 1 : 2;
+            difficulty_ = (Difficulty)(((int)difficulty_ + step) % 3);
+            if (audio_.ready()) audio_.play(Audio::UiMove, 0.5f);
+        }
+    } else if (k == SDLK_RETURN || k == SDLK_SPACE || k == SDLK_KP_ENTER) {
+        if (audio_.ready()) audio_.play(Audio::UiSelect, 0.6f);
+        switch (menuSel_) {
+            case 0: startSinglePlayer(); break;
+            case 1: startHost(); break;
+            case 2: menuScreen_ = MenuScreen::Join; SDL_StartTextInput(); break;
+            case 3:
+                difficulty_ = (Difficulty)(((int)difficulty_ + 1) % 3);
+                break;
+            case 4: running_ = false; break;
+        }
+    } else if (k == SDLK_ESCAPE) {
+        running_ = false;
+    }
 }
 
 void Game::switchWeapon(Actor& a, WeaponId id) {
@@ -386,11 +459,18 @@ void Game::update(float dt) {
         return;
     }
 
+    if (netMode_ == NetMode::Host) netHostTick(dt);
+
     bool actionPhase = (phase_ == Phase::Live || phase_ == Phase::Freeze);
     if (actionPhase) {
         if (!headless_) updatePlayer(dt);
         for (size_t i = 0; i < actors_.size(); ++i) {
-            if (headless_ || !actors_[i].isPlayer) updateBot(actors_[i], dt, (int)i);
+            Actor& a = actors_[i];
+            if (!headless_ && (int)i == localIndex_) continue;  // local human
+            if (a.remote && a.connected)
+                applyInput(a, a.netButtons, a.netWeaponSel, dt, (int)i);
+            else
+                updateBot(a, dt, (int)i);
         }
         for (auto& a : actors_) {
             if (a.fireCooldown > 0) a.fireCooldown -= dt;
@@ -446,73 +526,180 @@ void Game::update(float dt) {
     prevHp_ = pl.alive ? pl.hp : cfg::START_HP;
     if (damageFlash_ > 0) damageFlash_ -= dt;
 
+    // Animation timers.
+    if (recoil_ > 0) recoil_ = std::max(0.0f, recoil_ - dt * 65.0f);
+    if (hitMarker_ > 0) hitMarker_ -= dt;
+
+    // Footsteps for whoever we are currently viewing.
+    if (phase_ == Phase::Live) {
+        const Actor& v = viewActor();
+        if (v.alive && v.vel.lengthSq() > 4.0f) {
+            footstepTimer_ -= dt;
+            if (footstepTimer_ <= 0) {
+                footstepTimer_ = 0.34f;
+                if (audio_.ready() && !headless_)
+                    audio_.play(Audio::Footstep, 0.35f);
+            }
+        }
+    }
+
     mousePrev_ = mouseDown_;
 }
 
 // ---------------------------------------------------------------------------
 // Player control
 // ---------------------------------------------------------------------------
+int Game::gatherLocalButtons() const {
+    const Uint8* ks = SDL_GetKeyboardState(nullptr);
+    int b = 0;
+    if (ks[SDL_SCANCODE_W]) b |= BtnFwd;
+    if (ks[SDL_SCANCODE_S]) b |= BtnBack;
+    if (ks[SDL_SCANCODE_A]) b |= BtnLeft;
+    if (ks[SDL_SCANCODE_D]) b |= BtnRight;
+    if (ks[SDL_SCANCODE_LSHIFT]) b |= BtnWalk;
+    if (ks[SDL_SCANCODE_E]) b |= BtnUse;
+    if (ks[SDL_SCANCODE_R]) b |= BtnReload;
+    if (mouseDown_) b |= BtnFire;
+    return b;
+}
+
 void Game::updatePlayer(float dt) {
     Actor& p = player();
     if (!p.alive) return;
+    applyInput(p, gatherLocalButtons(), 0, dt, localIndex_);
+}
 
-    const Uint8* ks = SDL_GetKeyboardState(nullptr);
-    // Movement is relative to where the player is looking (FPS controls).
-    Vec2 fwd{std::cos(p.aim), std::sin(p.aim)};
-    Vec2 right{-std::sin(p.aim), std::cos(p.aim)};
-    Vec2 move{0, 0};
-    if (ks[SDL_SCANCODE_W]) move += fwd;
-    if (ks[SDL_SCANCODE_S]) move -= fwd;
-    if (ks[SDL_SCANCODE_D]) move += right;
-    if (ks[SDL_SCANCODE_A]) move -= right;
-    bool walking = ks[SDL_SCANCODE_LSHIFT];
+// Shared input application for the local human and remote (networked) players.
+void Game::applyInput(Actor& a, int buttons, int weaponSel, float dt,
+                      int selfIdx) {
+    if (!a.alive) { a.prevButtons = buttons; return; }
 
-    float speed = cfg::PLAYER_SPEED * (walking ? cfg::WALK_MULTIPLIER : 1.0f);
-    if (move.lengthSq() > 0) {
-        p.pos += move.normalized() * speed * dt;
-        p.pos = map_.collide(p.pos, cfg::PLAYER_RADIUS);
-        viewBob_ += speed * dt * 0.02f;  // drive weapon bob
+    if (weaponSel >= 1 && weaponSel <= 5) {
+        WeaponId w = (WeaponId)(weaponSel - 1);
+        if (a.owned[(size_t)w]) switchWeapon(a, w);
     }
 
-    if (phase_ != Phase::Live) return;  // no shooting / planting in freeze
+    Vec2 fwd{std::cos(a.aim), std::sin(a.aim)};
+    Vec2 right{-std::sin(a.aim), std::cos(a.aim)};
+    Vec2 move{0, 0};
+    if (buttons & BtnFwd) move += fwd;
+    if (buttons & BtnBack) move -= fwd;
+    if (buttons & BtnRight) move += right;
+    if (buttons & BtnLeft) move -= right;
+    bool walking = buttons & BtnWalk;
 
-    // Fire.
-    bool wantFire = mouseDown_ && (p.curDef().automatic || !mousePrev_);
-    if (wantFire) tryFire(p, 0);
+    float speed = cfg::PLAYER_SPEED * (walking ? cfg::WALK_MULTIPLIER : 1.0f);
+    bool moved = false;
+    if (move.lengthSq() > 0) {
+        Vec2 nv = move.normalized();
+        a.pos += nv * speed * dt;
+        a.pos = map_.collide(a.pos, cfg::PLAYER_RADIUS);
+        a.vel = nv * speed;
+        a.anim += speed * dt * 0.05f;
+        moved = true;
+        if (selfIdx == localIndex_ && !headless_) viewBob_ += speed * dt * 0.02f;
+    } else {
+        a.vel = {0, 0};
+    }
 
-    // Plant / defuse with E.
-    bool useKey = ks[SDL_SCANCODE_E];
-    if (useKey && p.hasBomb && !bombPlanted_) {
+    if (phase_ != Phase::Live) { a.prevButtons = buttons; return; }
+
+    const WeaponDef& def = a.curDef();
+    if (buttons & BtnReload) startReload(a);
+
+    bool fireHeld = (buttons & BtnFire) != 0;
+    bool fireEdge = fireHeld && !(a.prevButtons & BtnFire);
+    bool wantFire = def.automatic ? fireHeld : fireEdge;
+    if (wantFire) tryFire(a, selfIdx);
+
+    bool use = (buttons & BtnUse) != 0;
+    if (use && a.hasBomb && !bombPlanted_) {
         char label;
-        if (map_.inBombSite(p.pos, &label) && move.lengthSq() == 0) {
+        if (map_.inBombSite(a.pos, &label) && !moved) {
             plantProgress_ += dt;
             if (plantProgress_ >= cfg::PLANT_TIME) {
                 bombPlanted_ = true;
                 bombCarried_ = false;
-                p.hasBomb = false;
-                bombPos_ = p.pos;
+                a.hasBomb = false;
+                bombPos_ = a.pos;
                 bombSite_ = label;
                 bombTimer_ = cfg::BOMB_TIMER;
-                p.money = std::min(cfg::MAX_MONEY, p.money + cfg::REWARD_PLANT);
-                floatTexts_.push_back({"BOMB PLANTED", p.pos, 2.5f, cfg::C_BOMBSITE});
+                a.money = std::min(cfg::MAX_MONEY, a.money + cfg::REWARD_PLANT);
+                floatTexts_.push_back({"BOMB PLANTED", a.pos, 2.5f, cfg::C_BOMBSITE});
+                playAt(Audio::Plant, a.pos, 1.0f);
             }
         } else {
             plantProgress_ = 0;
         }
-    } else if (useKey && p.team == Team::CT && bombPlanted_ && !bombDefused_) {
-        if (distance(p.pos, bombPos_) < 40 && move.lengthSq() == 0) {
+    } else if (use && a.team == Team::CT && bombPlanted_ && !bombDefused_) {
+        if (distance(a.pos, bombPos_) < 40 && !moved) {
             defuseProgress_ += dt;
             if (defuseProgress_ >= cfg::DEFUSE_TIME) {
                 bombDefused_ = true;
-                p.money = std::min(cfg::MAX_MONEY, p.money + cfg::REWARD_DEFUSE);
+                a.money = std::min(cfg::MAX_MONEY, a.money + cfg::REWARD_DEFUSE);
+                playAt(Audio::Defuse, a.pos, 1.0f);
                 endRound(Team::CT, "BOMB DEFUSED");
             }
         } else {
             defuseProgress_ = 0;
         }
-    } else {
-        if (p.hasBomb) plantProgress_ = 0;
+    } else if (a.hasBomb) {
+        plantProgress_ = 0;
     }
+
+    a.prevButtons = buttons;
+}
+
+int Game::viewIndex() const {
+    if (localIndex_ >= 0 && localIndex_ < (int)actors_.size() &&
+        actors_[localIndex_].alive)
+        return localIndex_;
+    if (spectIdx_ >= 0 && spectIdx_ < (int)actors_.size()) {
+        const Actor& s = actors_[spectIdx_];
+        if (s.alive && s.team == player().team) return spectIdx_;
+    }
+    Team t = player().team;
+    for (size_t i = 0; i < actors_.size(); ++i)
+        if (actors_[i].alive && actors_[i].team == t) return (int)i;
+    return localIndex_;
+}
+
+void Game::cycleSpectate(int dir) {
+    Team t = player().team;
+    std::vector<int> mates;
+    for (size_t i = 0; i < actors_.size(); ++i)
+        if (actors_[i].alive && actors_[i].team == t && (int)i != localIndex_)
+            mates.push_back((int)i);
+    if (mates.empty()) return;
+    int cur = -1;
+    for (size_t i = 0; i < mates.size(); ++i)
+        if (mates[i] == spectIdx_) cur = (int)i;
+    cur = (cur + dir + (int)mates.size()) % (int)mates.size();
+    spectIdx_ = mates[cur];
+    if (audio_.ready()) audio_.play(Audio::UiMove, 0.5f);
+}
+
+void Game::playAt(Audio::Sfx s, const Vec2& pos, float baseVol) {
+    if (headless_ || !audio_.ready()) return;
+    const Actor& v = viewActor();
+    float dist = distance(v.pos, pos);
+    float vol = baseVol * clampf(1.0f - dist / 1100.0f, 0.0f, 1.0f);
+    if (vol <= 0.01f) return;
+    float pan = 0.0f;
+    Vec2 rel = pos - v.pos;
+    if (rel.lengthSq() > 1.0f) {
+        Vec2 right{-std::sin(v.aim), std::cos(v.aim)};
+        pan = clampf(dot(rel.normalized(), right), -1.0f, 1.0f);
+    }
+    audio_.play(s, vol, pan);
+}
+
+void Game::startSinglePlayer() {
+    shutdownNet();
+    netMode_ = NetMode::Single;
+    localIndex_ = 0;
+    spectIdx_ = 0;
+    startMatch();
 }
 
 void Game::doBuy(WeaponId id) {
@@ -555,6 +742,7 @@ void Game::startReload(Actor& a) {
     if (a.reserve[(size_t)w] <= 0) return;
     a.reloading = true;
     a.reloadTimer = def.reloadTime;
+    playAt(Audio::Reload, a.pos, 0.85f);
 }
 
 void Game::tryFire(Actor& a, int selfIdx) {
@@ -565,6 +753,9 @@ void Game::tryFire(Actor& a, int selfIdx) {
     if (def.magSize == 0) {
         // Knife: short-range melee swing.
         a.fireCooldown = def.fireDelay;
+        playAt(Audio::Knife, a.pos, 0.8f);
+        if (selfIdx == localIndex_ && !headless_)
+            recoil_ = std::min(recoil_ + 6.0f, 18.0f);
         for (size_t i = 0; i < actors_.size(); ++i) {
             if ((int)i == selfIdx) continue;
             Actor& t = actors_[i];
@@ -582,10 +773,24 @@ void Game::tryFire(Actor& a, int selfIdx) {
 
     a.mag[(size_t)w]--;
     a.fireCooldown = def.fireDelay;
-    a.muzzleFlash = 0.05f;
+    a.muzzleFlash = 0.06f;
+
+    // Weapon report (per-weapon synthesized sound).
+    Audio::Sfx shotSfx = Audio::ShotRifle;
+    switch (w) {
+        case WeaponId::Pistol: shotSfx = Audio::ShotPistol; break;
+        case WeaponId::Smg:    shotSfx = Audio::ShotSmg; break;
+        case WeaponId::Rifle:  shotSfx = Audio::ShotRifle; break;
+        case WeaponId::Sniper: shotSfx = Audio::ShotSniper; break;
+        default: break;
+    }
+    playAt(shotSfx, a.pos, 1.0f);
+    if (selfIdx == localIndex_ && !headless_)
+        recoil_ = std::min(recoil_ + 7.0f, 22.0f);
 
     bool moving = a.vel.lengthSq() > 1.0f;
-    float inacc = def.spread * (moving ? 1.4f : 0.6f);
+    float mul = a.extraSpread > 0.0f ? a.extraSpread : 1.0f;
+    float inacc = def.spread * (moving ? 1.4f : 0.6f) * mul;
 
     for (int pellet = 0; pellet < std::max(1, def.pellets); ++pellet) {
         float ang = a.aim + frand(-inacc, inacc);
@@ -637,12 +842,15 @@ void Game::applyDamage(Actor& target, int dmg, int attackerIdx) {
         remaining = (int)(dmg * 0.66f);
     }
     target.hp -= remaining;
+    playAt(Audio::Hit, target.pos, 0.7f);
+    if (attackerIdx == localIndex_ && !headless_) hitMarker_ = 0.28f;
 
     if (target.hp <= 0) {
         target.hp = 0;
         target.alive = false;
         target.deaths++;
         floatTexts_.push_back({"X", target.pos, 1.2f, cfg::col(230, 80, 80)});
+        playAt(Audio::Death, target.pos, 0.85f);
 
         if (attackerIdx >= 0 && attackerIdx < (int)actors_.size()) {
             Actor& killer = actors_[attackerIdx];
@@ -674,6 +882,14 @@ void Game::applyDamage(Actor& target, int dmg, int attackerIdx) {
 void Game::updateBomb(float dt) {
     if (!bombPlanted_ || bombDefused_) return;
     bombTimer_ -= dt;
+
+    // Beep faster as the timer runs down.
+    bombBeepTimer_ -= dt;
+    if (bombBeepTimer_ <= 0) {
+        bombBeepTimer_ = clampf(bombTimer_ / 40.0f, 0.12f, 1.0f);
+        playAt(Audio::Beep, bombPos_, 0.6f);
+    }
+
     if (bombTimer_ <= 0) {
         // Detonation: terrorists win, splash damage for flavor.
         for (auto& a : actors_) {
@@ -689,7 +905,7 @@ void Game::updateBomb(float dt) {
 // ---------------------------------------------------------------------------
 int Game::nearestVisibleEnemy(const Actor& a) const {
     int best = -1;
-    float bestD = BOT_VIEW_RANGE;
+    float bestD = botTuning(difficulty_).viewRange;
     for (size_t i = 0; i < actors_.size(); ++i) {
         const Actor& t = actors_[i];
         if (!t.alive || t.team == a.team) continue;
@@ -729,13 +945,14 @@ void Game::updateBot(Actor& a, float dt, int selfIdx) {
     if (a.strafeTimer > 0) a.strafeTimer -= dt;
     a.repathTimer -= dt;
 
+    BotTuning tune = botTuning(difficulty_);
     int enemy = nearestVisibleEnemy(a);
 
     if (enemy >= 0) {
         if (a.targetIdx != enemy) {
             a.targetIdx = enemy;
-            a.reactionTimer = frand(0.12f, 0.32f);  // human-like delay
-            a.aimError = frand(-0.10f, 0.10f);
+            a.reactionTimer = frand(tune.reactMin, tune.reactMax);
+            a.aimError = frand(-tune.aimError, tune.aimError);
         }
         a.botState = BotState::Engage;
     } else if (a.botState == BotState::Engage) {
@@ -750,9 +967,9 @@ void Game::updateBot(Actor& a, float dt, int selfIdx) {
         Vec2 toT = tgt.pos - a.pos;
         float dist = toT.length();
         float wantAim = std::atan2(toT.y, toT.x) + a.aimError;
-        // Smoothly turn toward the target.
+        // Smoothly turn toward the target (turn rate scales with difficulty).
         float diff = angleDiff(wantAim, a.aim);
-        float turn = clampf(diff, -8.0f * dt, 8.0f * dt);
+        float turn = clampf(diff, -tune.turnSpeed * dt, tune.turnSpeed * dt);
         a.aim += turn;
 
         // Maintain a comfortable engagement distance and strafe.
@@ -771,7 +988,7 @@ void Game::updateBot(Actor& a, float dt, int selfIdx) {
         const WeaponDef& def = a.curDef();
         if (def.magSize > 0 && a.mag[(size_t)a.weapon] <= 0) {
             startReload(a);
-        } else if (a.reactionTimer <= 0 && std::fabs(diff) < 0.22f) {
+        } else if (a.reactionTimer <= 0 && std::fabs(diff) < tune.fireAlign) {
             tryFire(a, selfIdx);
         }
     } else {
@@ -902,7 +1119,7 @@ void Game::drawFilledCircle(int cx, int cy, int radius, SDL_Color c) {
 }
 
 bool Game::projectToScreen(const Vec2& world, float& sx, float& depth) const {
-    const Actor& p = actors_[0];
+    const Actor& p = viewActor();
     float posX = p.pos.x / cfg::TILE, posY = p.pos.y / cfg::TILE;
     float dirX = std::cos(p.aim), dirY = std::sin(p.aim);
     float fovScale = std::tan(FOV * 0.5f);
@@ -919,7 +1136,7 @@ bool Game::projectToScreen(const Vec2& world, float& sx, float& depth) const {
 }
 
 void Game::renderWorld3D() {
-    const Actor& p = actors_[0];
+    const Actor& p = viewActor();
     const int W = cfg::SCREEN_W, H = cfg::SCREEN_H;
     int horizon = H / 2 + (int)pitch_;
 
@@ -1002,7 +1219,8 @@ void Game::renderWorld3D() {
 }
 
 void Game::renderSprites() {
-    const Actor& p = actors_[0];
+    const Actor& p = viewActor();
+    int vidx = viewIndex();
     const int W = cfg::SCREEN_W, H = cfg::SCREEN_H;
     int horizon = H / 2 + (int)pitch_;
     float posX = p.pos.x / cfg::TILE, posY = p.pos.y / cfg::TILE;
@@ -1013,7 +1231,8 @@ void Game::renderSprites() {
 
     struct Spr { float tx, ty; const Actor* a; };
     std::vector<Spr> list;
-    for (size_t i = 1; i < actors_.size(); ++i) {
+    for (size_t i = 0; i < actors_.size(); ++i) {
+        if ((int)i == vidx) continue;  // don't draw the viewer
         const Actor& a = actors_[i];
         float spx = a.pos.x / cfg::TILE - posX;
         float spy = a.pos.y / cfg::TILE - posY;
@@ -1031,7 +1250,8 @@ void Game::renderSprites() {
 
         if (s.a->alive) {
             float actorH = fullH * 0.85f;
-            float feetY = horizon + fullH * 0.5f;
+            float bob = std::sin(s.a->anim) * fullH * 0.012f;  // walk bounce
+            float feetY = horizon + fullH * 0.5f + bob;
             float headY = feetY - actorH;
             float spriteW = actorH * 0.45f;
             int x0 = (int)(screenX - spriteW / 2);
@@ -1135,12 +1355,18 @@ void Game::renderSprites() {
 }
 
 void Game::renderViewmodel() {
-    const Actor& p = actors_[0];
+    const Actor& p = viewActor();
     if (!p.alive) return;
     const int W = cfg::SCREEN_W, H = cfg::SCREEN_H;
     int cx = W / 2;
     int bob = (int)(std::sin(viewBob_) * 7.0f);
-    int gunY = H - 64 + bob;  // anchored just above the HUD bar
+    // Reload animation: the weapon dips down and comes back up.
+    int reloadDip = 0;
+    if (p.reloading) {
+        float prog = 1.0f - clampf(p.reloadTimer / std::max(0.01f, p.curDef().reloadTime), 0.0f, 1.0f);
+        reloadDip = (int)(std::sin(prog * PI) * 70.0f);
+    }
+    int gunY = H - 64 + bob + (int)recoil_ + reloadDip;  // recoil kicks it down
 
     WeaponId w = p.weapon;
     SDL_Color metal = cfg::col(38, 38, 44);
@@ -1197,13 +1423,26 @@ void Game::renderViewmodel() {
 void Game::renderCrosshair() {
     int cx = cfg::SCREEN_W / 2;
     int cy = cfg::SCREEN_H / 2 + (int)pitch_;
+    // Recoil makes the crosshair bloom slightly.
+    int gap = 6 + (int)recoil_;
+    int len = 10;
     SDL_SetRenderDrawColor(renderer_, 120, 235, 140, 220);
-    int gap = 6, len = 10;
     SDL_RenderDrawLine(renderer_, cx - gap - len, cy, cx - gap, cy);
     SDL_RenderDrawLine(renderer_, cx + gap, cy, cx + gap + len, cy);
     SDL_RenderDrawLine(renderer_, cx, cy - gap - len, cx, cy - gap);
     SDL_RenderDrawLine(renderer_, cx, cy + gap, cx, cy + gap + len);
     SDL_RenderDrawPoint(renderer_, cx, cy);
+
+    // Hit marker: a brief red X when we damage an enemy.
+    if (hitMarker_ > 0) {
+        Uint8 a = (Uint8)(clampf(hitMarker_ / 0.28f, 0, 1) * 255);
+        SDL_SetRenderDrawColor(renderer_, 235, 70, 70, a);
+        int d = 5, o = 8;
+        SDL_RenderDrawLine(renderer_, cx - o - d, cy - o - d, cx - o, cy - o);
+        SDL_RenderDrawLine(renderer_, cx + o, cy - o, cx + o + d, cy - o - d);
+        SDL_RenderDrawLine(renderer_, cx - o - d, cy + o + d, cx - o, cy + o);
+        SDL_RenderDrawLine(renderer_, cx + o, cy + o, cx + o + d, cy + o + d);
+    }
 }
 
 void Game::renderWorld() {
@@ -1309,6 +1548,7 @@ void Game::renderActor(const Actor& a) {
 
 void Game::renderHUD() {
     const Actor& p = player();
+    const Actor& v = viewActor();  // stats of whoever we're watching
 
     // Bottom bar background.
     SDL_SetRenderDrawColor(renderer_, cfg::C_HUD_BG.r, cfg::C_HUD_BG.g,
@@ -1318,31 +1558,36 @@ void Game::renderHUD() {
 
     char buf[128];
 
-    // Health & armor (bottom-left).
-    if (p.alive) {
-        std::snprintf(buf, sizeof(buf), "HP %d", p.hp);
-        Font::draw(renderer_, buf, 24, cfg::SCREEN_H - 50, 3, cfg::C_HEALTH);
-        std::snprintf(buf, sizeof(buf), "ARMOR %d", p.armor);
-        Font::draw(renderer_, buf, 24, cfg::SCREEN_H - 26, 2, cfg::C_ARMOR);
-    } else {
-        Font::draw(renderer_, "DEAD - SPECTATING", 24, cfg::SCREEN_H - 44, 3,
-                   cfg::col(220, 80, 80));
+    // Spectator banner.
+    if (!p.alive) {
+        std::snprintf(buf, sizeof(buf), "SPECTATING  %s", v.name.c_str());
+        Font::drawCentered(renderer_, buf, cfg::SCREEN_W / 2,
+                           cfg::SCREEN_H - 120, 2, cfg::col(220, 220, 120));
+        Font::drawCentered(renderer_, "A / D OR CLICK TO CHANGE VIEW",
+                           cfg::SCREEN_W / 2, cfg::SCREEN_H - 96, 2,
+                           cfg::col(150, 150, 150));
     }
 
-    // Money (bottom-left, above bar).
+    // Health & armor (bottom-left) of the viewed player.
+    std::snprintf(buf, sizeof(buf), "HP %d", v.hp);
+    Font::draw(renderer_, buf, 24, cfg::SCREEN_H - 50, 3, cfg::C_HEALTH);
+    std::snprintf(buf, sizeof(buf), "ARMOR %d", v.armor);
+    Font::draw(renderer_, buf, 24, cfg::SCREEN_H - 26, 2, cfg::C_ARMOR);
+
+    // Money (bottom-left, above bar) of the local player.
     std::snprintf(buf, sizeof(buf), "$%d", p.money);
     Font::draw(renderer_, buf, 24, cfg::SCREEN_H - 92, 3, cfg::col(120, 220, 120));
 
     // Weapon & ammo (bottom-right).
-    const WeaponDef& def = p.curDef();
+    const WeaponDef& def = v.curDef();
     Font::draw(renderer_, def.name, cfg::SCREEN_W - 360, cfg::SCREEN_H - 50, 3,
                cfg::C_TEXT);
     if (def.magSize > 0) {
-        std::snprintf(buf, sizeof(buf), "%d / %d", p.mag[(size_t)p.weapon],
-                      p.reserve[(size_t)p.weapon]);
+        std::snprintf(buf, sizeof(buf), "%d / %d", v.mag[(size_t)v.weapon],
+                      v.reserve[(size_t)v.weapon]);
         Font::draw(renderer_, buf, cfg::SCREEN_W - 360, cfg::SCREEN_H - 26, 2,
-                   p.reloading ? cfg::col(230, 180, 80) : cfg::C_TEXT);
-        if (p.reloading)
+                   v.reloading ? cfg::col(230, 180, 80) : cfg::C_TEXT);
+        if (v.reloading)
             Font::draw(renderer_, "RELOADING", cfg::SCREEN_W - 200,
                        cfg::SCREEN_H - 26, 2, cfg::col(230, 180, 80));
     }
@@ -1440,29 +1685,60 @@ void Game::renderBuyMenu() {
 }
 
 void Game::renderMainMenu() {
-    Font::drawCentered(renderer_, "C S  3", cfg::SCREEN_W / 2, 150, 12,
+    Font::drawCentered(renderer_, "C S  3", cfg::SCREEN_W / 2, 90, 12,
                        cfg::col(90, 150, 235));
-    Font::drawCentered(renderer_, "TACTICAL STRIKE", cfg::SCREEN_W / 2, 280, 4,
+    Font::drawCentered(renderer_, "TACTICAL STRIKE", cfg::SCREEN_W / 2, 210, 4,
                        cfg::C_TEXT);
 
-    const char* lines[] = {
-        "WASD - MOVE        MOUSE - AIM        LEFT CLICK - SHOOT",
-        "R - RELOAD     1-5 - WEAPONS     SHIFT - WALK     E - PLANT / DEFUSE",
-        "B - BUY MENU (FREEZE TIME)     TAB - SCOREBOARD     ESC - QUIT",
-        "",
-        "DEFEAT THE ENEMY TEAM OR COMPLETE THE BOMB OBJECTIVE",
-        "FIRST TO 8 ROUNDS WINS THE MATCH",
-    };
-    int y = 380;
-    for (auto* l : lines) {
-        Font::drawCentered(renderer_, l, cfg::SCREEN_W / 2, y, 2,
-                           cfg::col(200, 200, 210));
-        y += 30;
+    const char* diffName = difficulty_ == Difficulty::Easy   ? "EASY"
+                           : difficulty_ == Difficulty::Hard ? "HARD"
+                                                             : "NORMAL";
+
+    if (menuScreen_ == MenuScreen::Join) {
+        Font::drawCentered(renderer_, "JOIN A GAME", cfg::SCREEN_W / 2, 320, 4,
+                           cfg::C_TEXT);
+        Font::drawCentered(renderer_, "ENTER HOST IP ADDRESS:", cfg::SCREEN_W / 2,
+                           390, 2, cfg::col(190, 190, 200));
+        std::string shown = joinIp_;
+        if (((int)(SDL_GetTicks() / 400) & 1) == 0) shown += "_";
+        Font::drawCentered(renderer_, shown, cfg::SCREEN_W / 2, 430, 4,
+                           cfg::col(120, 220, 120));
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "PORT %d", joinPort_);
+        Font::drawCentered(renderer_, buf, cfg::SCREEN_W / 2, 480, 2,
+                           cfg::col(160, 160, 160));
+        Font::drawCentered(renderer_, "ENTER - CONNECT      ESC - BACK",
+                           cfg::SCREEN_W / 2, 540, 2, cfg::col(190, 190, 200));
+        if (!netStatus_.empty())
+            Font::drawCentered(renderer_, netStatus_, cfg::SCREEN_W / 2, 590, 2,
+                               cfg::col(235, 180, 90));
+        return;
     }
-    bool blink = ((int)(SDL_GetTicks() / 500) & 1) == 0;
-    if (blink)
-        Font::drawCentered(renderer_, "PRESS ENTER TO START", cfg::SCREEN_W / 2,
-                           y + 30, 3, cfg::col(120, 220, 120));
+
+    struct Item { std::string label; };
+    char diffbuf[48];
+    std::snprintf(diffbuf, sizeof(diffbuf), "DIFFICULTY:  %s", diffName);
+    std::string items[5] = {"PLAY (SINGLE PLAYER)", "HOST GAME (LAN/ONLINE)",
+                            "JOIN GAME", diffbuf, "QUIT"};
+    int y = 330;
+    for (int i = 0; i < 5; ++i) {
+        bool sel = (i == menuSel_);
+        SDL_Color c = sel ? cfg::col(120, 220, 120) : cfg::col(200, 200, 210);
+        std::string text = (sel ? "> " : "  ") + items[i];
+        Font::drawCentered(renderer_, text, cfg::SCREEN_W / 2, y, 3, c);
+        y += 46;
+    }
+
+    Font::drawCentered(renderer_,
+                       "ARROWS / WASD - NAVIGATE      ENTER - SELECT",
+                       cfg::SCREEN_W / 2, y + 20, 2, cfg::col(150, 150, 160));
+    Font::drawCentered(renderer_,
+                       "IN GAME: WASD MOVE  MOUSE LOOK  LMB SHOOT  R RELOAD  "
+                       "E PLANT/DEFUSE  B BUY",
+                       cfg::SCREEN_W / 2, y + 50, 2, cfg::col(130, 130, 140));
+    if (!netStatus_.empty())
+        Font::drawCentered(renderer_, netStatus_, cfg::SCREEN_W / 2, y + 84, 2,
+                           cfg::col(235, 180, 90));
 }
 
 void Game::renderRoundBanner() {
@@ -1605,3 +1881,12 @@ void Game::drawRectWorld(const SDL_Rect& worldRect, SDL_Color c, bool fill) {
     if (fill) SDL_RenderFillRect(renderer_, &r);
     else SDL_RenderDrawRect(renderer_, &r);
 }
+
+// ---------------------------------------------------------------------------
+// Networking (implemented in the next stage; placeholders for now)
+// ---------------------------------------------------------------------------
+void Game::startHost() { netStatus_ = "STARTING HOST..."; }
+void Game::startClient(const std::string&, int) { netStatus_ = "CONNECTING..."; }
+void Game::netHostTick(float) {}
+void Game::netClientTick(float) {}
+void Game::shutdownNet() { netMode_ = NetMode::Single; }
