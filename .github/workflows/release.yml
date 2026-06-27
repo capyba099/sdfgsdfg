@@ -1,0 +1,76 @@
+name: Release (Windows build)
+
+# Builds the Windows executable and publishes it to GitHub Releases.
+# Trigger it by pushing a version tag, e.g.:
+#   git tag v1.0.0 && git push origin v1.0.0
+# or run it manually from the Actions tab (workflow_dispatch).
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  SDL2_VERSION: "2.30.0"
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download SDL2 development libraries (VC)
+        shell: pwsh
+        run: |
+          $ver = "${{ env.SDL2_VERSION }}"
+          $url = "https://github.com/libsdl-org/SDL/releases/download/release-$ver/SDL2-devel-$ver-VC.zip"
+          Write-Host "Downloading $url"
+          Invoke-WebRequest -Uri $url -OutFile sdl2.zip
+          Expand-Archive sdl2.zip -DestinationPath sdl2 -Force
+          $root = "$env:GITHUB_WORKSPACE\sdl2\SDL2-$ver"
+          "SDL2_ROOT=$root"        | Out-File -FilePath $env:GITHUB_ENV -Append
+          "SDL2_DIR=$root\cmake"   | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Configure
+        shell: pwsh
+        run: cmake -S . -B build -A x64 -DSDL2_DIR="$env:SDL2_DIR" -DCMAKE_PREFIX_PATH="$env:SDL2_ROOT\cmake"
+
+      - name: Build
+        run: cmake --build build --config Release -j
+
+      - name: Stage distributable
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item build/Release/cs3.exe dist/
+          if (Test-Path build/Release/SDL2.dll) {
+            Copy-Item build/Release/SDL2.dll dist/
+          } else {
+            Copy-Item "$env:SDL2_ROOT/lib/x64/SDL2.dll" dist/
+          }
+          Copy-Item README.md dist/
+          Compress-Archive -Path dist/* -DestinationPath CS3-windows-x64.zip -Force
+          Get-ChildItem dist
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CS3-windows-x64
+          path: dist/*
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "CS 3 ${{ github.ref_name }}"
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            CS3-windows-x64.zip
+            dist/cs3.exe
+            dist/SDL2.dll
