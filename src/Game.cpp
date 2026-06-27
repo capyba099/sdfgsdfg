@@ -257,15 +257,28 @@ int Game::run() {
         int maxFrames = std::atoi(hv);
         if (maxFrames <= 0) maxFrames = 6000;  // ~100s at 60 fps
         headless_ = true;
-        startMatch();
-        phase_ = Phase::Freeze;
-        phaseTimer_ = cfg::FREEZE_TIME;
+        setvbuf(stdout, nullptr, _IONBF, 0);  // unbuffered logs for tests
+        if (const char* he = std::getenv("CS3_HOST")) {
+            (void)he;
+            startHost();
+            std::printf("[host] mode=%d status='%s'\n", (int)netMode_,
+                        netStatus_.c_str());
+        } else if (const char* je = std::getenv("CS3_JOIN")) {
+            startClient(je, joinPort_);
+            std::printf("[client] mode=%d localIndex=%d status='%s'\n",
+                        (int)netMode_, localIndex_, netStatus_.c_str());
+        } else {
+            startMatch();
+            phase_ = Phase::Freeze;
+            phaseTimer_ = cfg::FREEZE_TIME;
+        }
         const float dt = 1.0f / 60.0f;
         bool doRender = std::getenv("CS3_RENDER") != nullptr;
         int lastReported = -1;
         for (int f = 0; f < maxFrames && running_; ++f) {
             update(dt);
             if (doRender) render();  // exercise the 3D render path headlessly
+            if (netMode_ != NetMode::Single) SDL_Delay(15);  // run net in realtime
             if (ctScore_ + tScore_ != lastReported) {
                 lastReported = ctScore_ + tScore_;
                 std::printf("[sim] round=%d ctAlive=%d tAlive=%d score CT %d : %d T  %s\n",
@@ -446,6 +459,9 @@ void Game::switchWeapon(Actor& a, WeaponId id) {
 void Game::update(float dt) {
     if (phase_ == Phase::MainMenu || phase_ == Phase::MatchEnd) return;
 
+    if (netMode_ == NetMode::Client) {
+        netClientTick(dt);
+    } else {
     phaseTimer_ -= dt;
 
     if (phase_ == Phase::Freeze && phaseTimer_ <= 0) {
@@ -490,6 +506,8 @@ void Game::update(float dt) {
     }
 
     if (phase_ == Phase::Live) updateBomb(dt);
+
+    }  // end server-side simulation (host / single player)
 
     // Tracer / float-text lifetimes.
     for (auto& t : tracers_) t.life -= dt;
@@ -1882,11 +1900,3 @@ void Game::drawRectWorld(const SDL_Rect& worldRect, SDL_Color c, bool fill) {
     else SDL_RenderDrawRect(renderer_, &r);
 }
 
-// ---------------------------------------------------------------------------
-// Networking (implemented in the next stage; placeholders for now)
-// ---------------------------------------------------------------------------
-void Game::startHost() { netStatus_ = "STARTING HOST..."; }
-void Game::startClient(const std::string&, int) { netStatus_ = "CONNECTING..."; }
-void Game::netHostTick(float) {}
-void Game::netClientTick(float) {}
-void Game::shutdownNet() { netMode_ = NetMode::Single; }

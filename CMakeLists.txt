@@ -50,6 +50,11 @@ else()
     target_link_libraries(cs3 PRIVATE ${SDL2_LIBRARIES})
 endif()
 
+# Sockets: Winsock on Windows.
+if(WIN32)
+    target_link_libraries(cs3 PRIVATE ws2_32)
+endif()
+
 # Copy SDL2.dll next to the executable on Windows so the game is runnable
 # straight from the build/output directory.
 if(WIN32)

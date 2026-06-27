@@ -34,8 +34,21 @@ workflow whenever a version tag (`v*`) is pushed.
 - **First-person 3D** via a from-scratch software raycaster: shaded walls,
   gradient floor/ceiling, mouse-look, a weapon viewmodel with muzzle flash, a
   crosshair, damage flashes and depth-buffered enemy billboards.
+- **Online multiplayer** — host a server and let friends join by IP. Each
+  connected player takes over a slot; the rest stay AI bots.
+- **Procedural sound** — every effect (gunshots per weapon, reloads, hits,
+  deaths, bomb beeps, footsteps, win/lose jingles, UI) is synthesized at
+  runtime and mixed with distance attenuation and stereo panning. No audio
+  files needed.
+- **Difficulty levels** (Easy / Normal / Hard) that scale bot reaction time,
+  aim error, weapon spread, turn speed and awareness — bots are no longer
+  brutal on the lower settings.
+- **Spectator mode** — when you die you can watch your living teammates in
+  first person and cycle between them.
+- **Animations** — weapon recoil and reload, crosshair bloom, hit markers,
+  sprite walk-bob, muzzle flashes and screen damage feedback.
 - **5v5 Counter-Terrorists vs Terrorists** — you play a Counter-Terrorist; every
-  other slot is filled by an AI bot.
+  other slot is filled by an AI bot (or a remote human in multiplayer).
 - **Bomb-defusal objective** — terrorists carry and plant the bomb on site A or
   B; counter-terrorists must defuse it or eliminate the enemy team.
 - **AI bots** with grid pathfinding (BFS), line-of-sight detection, reaction
@@ -108,8 +121,36 @@ cmake --build build -j
 | `E` | Hold to plant (as a T carrier) or defuse (as a CT) |
 | `B` | Toggle buy menu (during freeze time) |
 | `TAB` | Hold to show the scoreboard |
-| `Enter` | Start match / continue from menus |
-| `Esc` | Close buy menu / quit from main menu |
+| Arrows / `W` `S` | Navigate the main menu; `Left`/`Right` change difficulty |
+| `Enter` | Select menu item / continue from menus |
+| `A` `D` / click | While dead: cycle which teammate you spectate |
+| `Esc` | Close buy menu / back / quit from main menu |
+
+## Multiplayer
+
+CS 3 includes a built-in client-server mode so other people can play with you.
+
+- **Host:** pick **HOST GAME** in the main menu. The game starts listening on
+  TCP port **27015** and you play immediately; bots fill the empty slots until
+  humans connect and take them over.
+- **Join:** pick **JOIN GAME**, type the host's IP address and press `Enter`.
+
+**Same network (LAN):** the client just needs the host's local IP (e.g.
+`192.168.1.x`) — it works out of the box.
+
+**Across the internet / different networks:** because the game speaks plain TCP
+and does not run a relay service, the host must make port `27015` reachable. Do
+one of:
+
+- **Port-forward** TCP `27015` on the host's router to the host machine, then
+  clients connect to the host's public IP; or
+- Put both machines on the **same virtual LAN** with a tool like
+  [Tailscale](https://tailscale.com), Radmin VPN or Hamachi, then connect to the
+  host's VPN IP.
+
+The host is authoritative and broadcasts state ~30 Hz; clients send input
+~60 Hz. This is a straightforward LAN-style netcode (no lag compensation), so
+it plays best on low-latency connections.
 
 ## How to win a round
 
@@ -129,7 +170,10 @@ src/
   Font.{h,cpp}  Self-contained 5x7 bitmap text renderer
   Weapon.{h,cpp}Weapon catalogue & stats
   Map.{h,cpp}   Tile map, collision, raycasting, BFS pathfinding, rendering
+  Audio.{h,cpp} Procedural sound engine (synthesized SFX, SDL audio mixing)
+  Net.{h,cpp}   Cross-platform (POSIX/Winsock) non-blocking TCP socket layer
   Game.{h,cpp}  Entities, player, bot AI, combat, bomb, rounds, HUD, 3D renderer
+  GameNet.cpp   Host/client networking, snapshot protocol, remote players
   main.cpp      Entry point
 CMakeLists.txt  Build configuration
 build.sh        One-command build helper
@@ -145,3 +189,6 @@ SDL_VIDEODRIVER=dummy CS3_HEADLESS=120000 ./build/cs3
 ```
 
 `CS3_HEADLESS` is the maximum number of 60 fps simulation frames to run.
+Set `CS3_RENDER=1` to also exercise the 3D render path. The networking can be
+loopback-tested headlessly too: run one instance with `CS3_HOST=1` and another
+with `CS3_JOIN=127.0.0.1`.

@@ -140,6 +140,9 @@ private:
     void netHostTick(float dt);
     void netClientTick(float dt);
     void shutdownNet();
+    std::string netBuildSnapshot() const;
+    void netApplySnapshot(const char* data, int len);
+    void netApplyInput(int actorIdx, const char* data, int len);
 
     // Bots -----------------------------------------------------------------
     void updateBot(Actor& a, float dt, int selfIdx);
